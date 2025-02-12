@@ -9,7 +9,9 @@ enum Dist {
   armbian,
   arch,
   alpine,
-  rocky;
+  rocky,
+  deepin,
+  ;
 }
 
 extension StringX on String {
@@ -20,6 +22,17 @@ extension StringX on String {
         return dist;
       }
     }
+    for (final wrt in _wrts) {
+      if (lower.contains(wrt)) {
+        return Dist.wrt;
+      }
+    }
     return null;
   }
 }
+
+// Special rules
+
+const _wrts = [
+  'istoreos',
+];

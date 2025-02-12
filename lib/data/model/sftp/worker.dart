@@ -5,10 +5,12 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:easy_isolate/easy_isolate.dart';
-import 'package:toolbox/core/utils/misc.dart';
-import 'package:toolbox/core/utils/server.dart';
+import 'package:fl_lib/fl_lib.dart';
+import 'package:server_box/core/utils/server.dart';
+import 'package:server_box/data/model/server/server_private_info.dart';
+import 'package:server_box/data/res/store.dart';
 
-import 'req.dart';
+part 'req.dart';
 
 class SftpWorker {
   final Function(Object event) onNotify;
@@ -21,7 +23,7 @@ class SftpWorker {
     required this.req,
   });
 
-  void dispose() {
+  void _dispose() {
     worker.dispose();
   }
 
@@ -49,17 +51,15 @@ Future<void> isolateMessageHandler(
   SendPort mainSendPort,
   SendErrorFunction sendError,
 ) async {
-  switch (data.runtimeType) {
-    case SftpReq:
-      switch (data.type) {
+  switch (data) {
+    case final SftpReq val:
+      switch (val.type) {
         case SftpReqType.download:
           await _download(data, mainSendPort, sendError);
           break;
         case SftpReqType.upload:
           await _upload(data, mainSendPort, sendError);
           break;
-        default:
-          sendError(Exception('unknown type'));
       }
       break;
     default:
@@ -75,29 +75,35 @@ Future<void> _download(
   try {
     mainSendPort.send(SftpWorkerStatus.preparing);
     final watch = Stopwatch()..start();
-    final client = await genClient(req.spi, privateKey: req.privateKey);
+    final client = await genClient(
+      req.spi,
+      privateKey: req.privateKey,
+      jumpSpi: req.jumpSpi,
+      jumpPrivateKey: req.jumpPrivateKey,
+    );
     mainSendPort.send(SftpWorkerStatus.sshConnectted);
 
-    final remotePath = req.remotePath;
-    final localPath = req.localPath;
-    await Directory(localPath.substring(0, req.localPath.lastIndexOf('/')))
-        .create(recursive: true);
-    final local = File(localPath);
-    if (await local.exists()) {
-      await local.delete();
-    }
-    final localFile = local.openWrite(mode: FileMode.append);
-    final file = await (await client.sftp()).open(remotePath);
+    /// Create the directory if not exists
+    final dirPath = req.localPath.substring(0, req.localPath.lastIndexOf('/'));
+    await Directory(dirPath).create(recursive: true);
+
+    /// Use [FileMode.write] to overwrite the file
+    final localFile = File(req.localPath).openWrite(mode: FileMode.write);
+    final file = await (await client.sftp()).open(req.remotePath);
     final size = (await file.stat()).size;
     if (size == null) {
-      mainSendPort.send(Exception('can not get file size'));
+      mainSendPort.send(Exception('can\'t get file size: ${req.remotePath}'));
       return;
     }
-    // Read 10m each time
-    const defaultChunkSize = 1024 * 1024;
-    final chunkSize = size > defaultChunkSize ? defaultChunkSize : size;
+
     mainSendPort.send(size);
-    mainSendPort.send(SftpWorkerStatus.downloading);
+    mainSendPort.send(SftpWorkerStatus.loading);
+
+    // Read 2m each time
+    // Issue #161
+    // The download speed is about 2m/s may due to single core performance
+    const defaultChunkSize = 1024 * 1024 * 2;
+    final chunkSize = size > defaultChunkSize ? defaultChunkSize : size;
     for (var i = 0; i < size; i += chunkSize) {
       final fileData = file.read(length: chunkSize);
       await for (var form in fileData) {
@@ -105,8 +111,10 @@ Future<void> _download(
         mainSendPort.send((i + form.length) / size * 100);
       }
     }
+
     await localFile.close();
     await file.close();
+
     mainSendPort.send(watch.elapsed);
     mainSendPort.send(SftpWorkerStatus.finished);
   } catch (e) {
@@ -122,22 +130,37 @@ Future<void> _upload(
   try {
     mainSendPort.send(SftpWorkerStatus.preparing);
     final watch = Stopwatch()..start();
-    final client = await genClient(req.spi, privateKey: req.privateKey);
+    final client = await genClient(
+      req.spi,
+      privateKey: req.privateKey,
+      jumpSpi: req.jumpSpi,
+      jumpPrivateKey: req.jumpPrivateKey,
+    );
     mainSendPort.send(SftpWorkerStatus.sshConnectted);
 
-    final localPath = req.localPath;
-    final fileName = getFileName(localPath) ?? 'srvbox_sftp_upload';
-    final remotePath = '${req.remotePath}/$fileName';
-    final local = File(localPath);
+    final local = File(req.localPath);
     if (!await local.exists()) {
       mainSendPort.send(Exception('local file not exists'));
       return;
     }
+    final localLen = await local.length();
+    mainSendPort.send(localLen);
+    mainSendPort.send(SftpWorkerStatus.loading);
     final localFile = local.openRead().cast<Uint8List>();
     final sftp = await client.sftp();
-    final file = await sftp.open(remotePath,
-        mode: SftpFileOpenMode.write | SftpFileOpenMode.create);
-    final writer = file.write(localFile);
+    // If remote exists, overwrite it
+    final file = await sftp.open(
+      req.remotePath,
+      mode: SftpFileOpenMode.truncate |
+          SftpFileOpenMode.create |
+          SftpFileOpenMode.write,
+    );
+    final writer = file.write(
+      localFile,
+      onProgress: (total) {
+        mainSendPort.send(total / localLen * 100);
+      },
+    );
     await writer.done;
     await file.close();
     mainSendPort.send(watch.elapsed);

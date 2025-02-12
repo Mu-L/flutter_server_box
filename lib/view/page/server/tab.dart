@@ -1,541 +1,645 @@
-import 'dart:io' show Directory, File, Platform, Process;
+import 'dart:async';
+import 'dart:math' as math;
 
-import 'package:after_layout/after_layout.dart';
-import 'package:circle_chart/circle_chart.dart';
+import 'package:fl_lib/fl_lib.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_gen/gen_l10n/l10n.dart';
-import 'package:get_it/get_it.dart';
-import 'package:nil/nil.dart';
-import 'package:provider/provider.dart';
-import 'package:toolbox/core/extension/order.dart';
-import 'package:toolbox/data/model/app/net_view.dart';
-import 'package:toolbox/data/model/server/snippet.dart';
-import 'package:toolbox/data/provider/snippet.dart';
-import 'package:toolbox/view/page/process.dart';
-import 'package:toolbox/view/widget/tag/picker.dart';
-import 'package:toolbox/view/widget/tag/switcher.dart';
+import 'package:icons_plus/icons_plus.dart';
+import 'package:server_box/core/extension/context/locale.dart';
+import 'package:server_box/core/extension/ssh_client.dart';
+import 'package:server_box/data/model/app/shell_func.dart';
+import 'package:server_box/data/model/server/try_limiter.dart';
+import 'package:server_box/data/res/build_data.dart';
+import 'package:server_box/data/res/store.dart';
+import 'package:server_box/view/page/server/edit.dart';
+import 'package:server_box/view/page/setting/entry.dart';
+import 'package:server_box/view/widget/percent_circle.dart';
 
-import '../../../core/route.dart';
-import '../../../core/utils/misc.dart' hide pathJoin;
-import '../../../core/utils/platform.dart';
-import '../../../core/utils/server.dart';
-import '../../../core/utils/ui.dart';
-import '../../../data/model/server/disk.dart';
-import '../../../data/model/server/server.dart';
-import '../../../data/model/server/server_private_info.dart';
-import '../../../data/model/server/server_status.dart';
-import '../../../data/provider/server.dart';
-import '../../../data/res/color.dart';
-import '../../../data/model/app/menu.dart';
-import '../../../data/res/ui.dart';
-import '../../../data/store/setting.dart';
-import '../../../locator.dart';
-import '../../widget/popup_menu.dart';
-import '../../widget/round_rect_card.dart';
-import '../docker.dart';
-import '../pkg.dart';
-import '../storage/sftp.dart';
-import '../ssh/term.dart';
-import 'detail.dart';
-import 'edit.dart';
+import 'package:server_box/core/route.dart';
+import 'package:server_box/data/model/app/net_view.dart';
+import 'package:server_box/data/model/server/server.dart';
+import 'package:server_box/data/model/server/server_private_info.dart';
+import 'package:server_box/data/provider/server.dart';
+import 'package:server_box/view/widget/server_func_btns.dart';
+
+part 'top_bar.dart';
 
 class ServerPage extends StatefulWidget {
-  const ServerPage({Key? key}) : super(key: key);
+  const ServerPage({super.key});
 
   @override
-  _ServerPageState createState() => _ServerPageState();
+  State<ServerPage> createState() => _ServerPageState();
 }
+
+const _cardPad = 74.0;
+const _cardPadSingle = 13.0;
 
 class _ServerPageState extends State<ServerPage>
     with AutomaticKeepAliveClientMixin, AfterLayoutMixin {
   late MediaQueryData _media;
-  late ThemeData _theme;
-  late ServerProvider _serverProvider;
-  late SettingStore _settingStore;
-  late S _s;
 
-  String? _tag;
+  late double _textFactorDouble;
+  double _offset = 1;
+  late TextScaler _textFactor;
+
+  final _cardsStatus = <String, _CardNotifier>{};
+
+  Timer? _timer;
+
+  final _tag = ''.vn;
+  bool _useDoubleColumn = false;
+
+  final _scrollController = ScrollController();
+  final _autoHideCtrl = AutoHideController();
+
+  @override
+  void dispose() {
+    super.dispose();
+    _timer?.cancel();
+    _scrollController.dispose();
+    _autoHideCtrl.dispose();
+    _tag.dispose();
+  }
 
   @override
   void initState() {
     super.initState();
-    _serverProvider = locator<ServerProvider>();
-    _settingStore = locator<SettingStore>();
+    if (!Stores.setting.fullScreenJitter.fetch()) return;
+    _timer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) {
+        _updateOffset();
+        setState(() {});
+      } else {
+        _timer?.cancel();
+      }
+    });
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     _media = MediaQuery.of(context);
-    _theme = Theme.of(context);
-    _s = S.of(context)!;
+    _updateOffset();
+    _updateTextScaler();
+    _useDoubleColumn = _media.size.width > 639 &&
+        Stores.setting.doubleColumnServersPage.fetch();
   }
 
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    return OrientationBuilder(builder: (_, orientation) {
+      if (orientation == Orientation.landscape) {
+        final useFullScreen = Stores.setting.fullScreen.fetch();
+        if (useFullScreen) return _buildLandscape();
+      }
+      return _buildPortrait();
+    });
+  }
+
+  Widget _buildPortrait() {
     return Scaffold(
-      body: _buildBody(),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () => AppRoute(
-          const ServerEditPage(),
-          'Add server info page',
-        ).go(context),
-        tooltip: _s.addAServer,
-        heroTag: 'server',
-        child: const Icon(Icons.add),
+      appBar: _TopBar(
+        tags: ServerProvider.tags,
+        onTagChanged: (p0) => _tag.value = p0,
+        initTag: _tag.value,
+      ),
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _autoHideCtrl.show(),
+        child: ListenableBuilder(
+          listenable: Stores.setting.textFactor.listenable(),
+          builder: (_, __) {
+            _updateTextScaler();
+            return _buildBody();
+          },
+        ),
+      ),
+      floatingActionButton: AutoHide(
+        direction: AxisDirection.right,
+        offset: 75,
+        scrollController: _scrollController,
+        hideController: _autoHideCtrl,
+        child: FloatingActionButton(
+          heroTag: 'addServer',
+          onPressed: () => ServerEditPage.route.go(context),
+          tooltip: libL10n.add,
+          child: const Icon(Icons.add),
+        ),
       ),
     );
+  }
+
+  Widget _buildLandscape() {
+    final offset = Offset(_offset, _offset);
+    return Padding(
+      // Avoid display cutout
+      padding: EdgeInsets.all(_offset.abs()),
+      child: Transform.translate(
+        offset: offset,
+        child: Stack(
+          children: [
+            _buildLandscapeBody(),
+            Positioned(
+              top: 0,
+              left: 0,
+              child: IconButton(
+                onPressed: () => SettingsPage.route.go(context),
+                icon: const Icon(Icons.settings, color: Colors.grey),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLandscapeBody() {
+    return ServerProvider.serverOrder.listenVal((order) {
+      if (order.isEmpty) {
+        return Center(
+          child: Text(libL10n.empty, textAlign: TextAlign.center),
+        );
+      }
+
+      return PageView.builder(
+        itemCount: order.length,
+        itemBuilder: (_, idx) {
+          final id = order[idx];
+          final srv = ServerProvider.pick(id: id);
+          if (srv == null) return UIs.placeholder;
+
+          return srv.listenVal((srv) {
+            final title = _buildServerCardTitle(srv);
+            final List<Widget> children = [
+              title,
+              ..._buildNormalCard(srv.status, srv.spi).joinWith(SizedBox(
+                height: _media.size.height / 10,
+              ))
+            ];
+
+            return Padding(
+              padding: _media.padding,
+              child: ListenableBuilder(
+                listenable: _getCardNoti(id),
+                builder: (_, __) {
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: children,
+                  );
+                },
+              ),
+            );
+          });
+        },
+      );
+    });
   }
 
   Widget _buildBody() {
-    return RefreshIndicator(
-      onRefresh: () async =>
-          await _serverProvider.refreshData(onlyFailed: true),
-      child: Consumer<ServerProvider>(
-        builder: (_, pro, __) {
-          if (!pro.tags.contains(_tag)) {
-            _tag = null;
-          }
-          if (pro.serverOrder.isEmpty) {
-            return Center(
-              child: Text(
-                _s.serverTabEmpty,
-                textAlign: TextAlign.center,
-              ),
-            );
-          }
-          final filtered = pro.serverOrder
-              .where((e) => pro.servers.containsKey(e))
-              .where((e) =>
-                  _tag == null ||
-                  (pro.servers[e]?.spi.tags?.contains(_tag) ?? false))
-              .toList();
-          return ReorderableListView.builder(
-            header: TagSwitcher(
-              tags: pro.tags,
-              width: _media.size.width,
-              onTagChanged: (p0) => setState(() {
-                _tag = p0;
-              }),
-              initTag: _tag,
-              all: _s.all,
-            ),
-            padding: const EdgeInsets.fromLTRB(7, 10, 7, 7),
-            onReorder: (oldIndex, newIndex) => setState(() {
-              pro.serverOrder.moveByItem(
-                filtered,
-                oldIndex,
-                newIndex,
-                property: _settingStore.serverOrder,
-              );
-            }),
-            buildDefaultDragHandles: false,
-            itemBuilder: (_, index) => ReorderableDelayedDragStartListener(
-              key: ValueKey('$_tag${filtered[index]}'),
-              index: index,
-              child: _buildEachServerCard(pro.servers[filtered[index]]),
-            ),
-            itemCount: filtered.length,
+    return ServerProvider.serverOrder.listenVal(
+      (order) {
+        if (order.isEmpty) {
+          return Center(
+            child: Text(libL10n.empty, textAlign: TextAlign.center),
           );
-        },
-      ),
-    );
-  }
-
-  Widget _buildEachServerCard(Server? si) {
-    if (si == null) {
-      return nil;
-    }
-    return GestureDetector(
-      key: Key(si.spi.id + (_tag ?? '')),
-      onTap: () {
-        if (si.state.canViewDetails) {
-          AppRoute(
-            ServerDetailPage(si.spi.id),
-            'server detail page',
-          ).go(context);
-        } else if (si.status.failedInfo != null) {
-          _showFailReason(si.status);
         }
-      },
-      child: RoundRectCard(
-        Padding(
-          padding: const EdgeInsets.all(13),
-          child: _buildRealServerCard(si.status, si.state, si.spi),
-        ),
-      ),
-    );
-  }
 
-  Widget _buildRealServerCard(
-    ServerStatus ss,
-    ServerState cs,
-    ServerPrivateInfo spi,
-  ) {
-    final rootDisk = findRootDisk(ss.disk);
-    late final List<Widget> children;
-    var height = 23.0;
-    if (cs != ServerState.finished) {
-      children = [
-        _buildServerCardTitle(ss, cs, spi),
-      ];
-    } else {
-      height = 137;
-      children = [
-        _buildServerCardTitle(ss, cs, spi),
-        height13,
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            _buildPercentCircle(ss.cpu.usedPercent()),
-            _buildPercentCircle(ss.mem.usedPercent * 100),
-            _buildNet(ss),
-            _buildIOData(
-                'Total:\n${rootDisk?.size}', 'Used:\n${rootDisk?.usedPercent}%')
-          ],
-        ),
-        height13,
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: [
-            _buildExplainText('CPU'),
-            _buildExplainText('Mem'),
-            _buildExplainText('Net'),
-            _buildExplainText('Disk'),
-          ],
-        ),
-        const SizedBox(height: 3),
-      ];
-    }
-
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 377),
-      curve: Curves.fastEaseInToSlowEaseOut,
-      height: height,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: children,
-      ),
-    );
-  }
-
-  Widget _buildServerCardTitle(
-    ServerStatus ss,
-    ServerState cs,
-    ServerPrivateInfo spi,
-  ) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 7),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Row(
-            children: [
-              Text(
-                spi.name,
-                style: textSize13Bold,
-                textScaleFactor: 1.0,
-              ),
-              const Icon(
-                Icons.keyboard_arrow_right,
-                size: 17,
-                color: Colors.grey,
-              )
-            ],
-          ),
-          Row(
-            children: [
-              _buildTopRightText(ss, cs),
-              width13,
-              _buildSSHBtn(spi),
-              _buildMoreBtn(spi),
-            ],
-          )
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTopRightText(ServerStatus ss, ServerState cs) {
-    final topRightStr = _getTopRightStr(
-      cs,
-      ss.temps.first,
-      ss.uptime,
-      ss.failedInfo,
-    );
-    if (cs == ServerState.failed && ss.failedInfo != null) {
-      return GestureDetector(
-        onTap: () => _showFailReason(ss),
-        child: Text(
-          _s.viewErr,
-          style: textSize12Grey,
-          textScaleFactor: 1.0,
-        ),
-      );
-    }
-    return Text(
-      topRightStr,
-      style: textSize12Grey,
-      textScaleFactor: 1.0,
-    );
-  }
-
-  void _showFailReason(ServerStatus ss) {
-    showRoundDialog(
-      context: context,
-      title: Text(_s.error),
-      child: SingleChildScrollView(
-        child: Text(ss.failedInfo ?? _s.unknownError),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => copy2Clipboard(ss.failedInfo!),
-          child: Text(_s.copy),
-        )
-      ],
-    );
-  }
-
-  Widget _buildSSHBtn(ServerPrivateInfo spi) {
-    return GestureDetector(
-      child: const Icon(Icons.terminal, size: 21),
-      onTap: () => gotoSSH(spi),
-    );
-  }
-
-  Widget _buildMoreBtn(ServerPrivateInfo spi) {
-    return PopupMenu(
-      items: ServerTabMenuType.values.map((e) => e.build(_s)).toList(),
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      onSelected: (ServerTabMenuType value) async {
-        switch (value) {
-          case ServerTabMenuType.pkg:
-            AppRoute(PkgManagePage(spi), 'pkg manage').checkClientAndGo(
-              context: context,
-              s: _s,
-              id: spi.id,
-            );
-            break;
-          case ServerTabMenuType.sftp:
-            AppRoute(SftpPage(spi), 'SFTP').checkClientAndGo(
-              context: context,
-              s: _s,
-              id: spi.id,
-            );
-            break;
-          case ServerTabMenuType.snippet:
-            final provider = locator<SnippetProvider>();
-            final snippets = await showDialog<List<Snippet>>(
-              context: context,
-              builder: (_) => TagPicker<Snippet>(
-                items: provider.snippets,
-                containsTag: (t, tag) => t.tags?.contains(tag) ?? false,
-                tags: provider.tags.toSet(),
-                name: (t) => t.name,
-              ),
-            );
-            if (snippets == null) {
-              return;
+        return _tag.listenVal(
+          (val) {
+            final filtered = _filterServers(order);
+            if (_useDoubleColumn &&
+                Stores.setting.doubleColumnServersPage.fetch()) {
+              return _buildBodyMedium(filtered);
             }
-            final result = await _serverProvider.runSnippets(spi.id, snippets);
-            if (result != null && result.isNotEmpty) {
-              showRoundDialog(
-                context: context,
-                title: Text(_s.result),
-                child: Text(result),
-                actions: [
-                  TextButton(
-                    onPressed: () => copy2Clipboard(result),
-                    child: Text(_s.copy),
-                  )
-                ],
-              );
-            }
-            break;
-          case ServerTabMenuType.edit:
-            AppRoute(ServerEditPage(spi: spi), 'Edit server info').go(context);
-            break;
-          case ServerTabMenuType.docker:
-            AppRoute(DockerManagePage(spi), 'Docker manage').checkClientAndGo(
-              context: context,
-              s: _s,
-              id: spi.id,
-            );
-            break;
-          case ServerTabMenuType.process:
-            AppRoute(ProcessPage(spi: spi), 'process page').checkClientAndGo(
-              context: context,
-              s: _s,
-              id: spi.id,
-            );
-            break;
-        }
-      },
-    );
-  }
-
-  Widget _buildNet(ServerStatus ss) {
-    return ValueListenableBuilder<NetViewType>(
-      valueListenable: _settingStore.netViewType.listenable(),
-      builder: (_, val, __) {
-        final data = val.build(ss);
-        return AnimatedSwitcher(
-          duration: const Duration(milliseconds: 177),
-          child: _buildIOData(data.up, data.down),
+            return _buildBodySmall(filtered: filtered);
+          },
         );
       },
     );
   }
 
-  Widget _buildExplainText(String text) {
-    return SizedBox(
-      width: _media.size.width * 0.2,
-      child: Text(
-        text,
-        style: const TextStyle(fontSize: 12),
-        textAlign: TextAlign.center,
-        textScaleFactor: 1.0,
+  Widget _buildBodySmall({
+    required List<String> filtered,
+    EdgeInsets? padding = const EdgeInsets.fromLTRB(7, 0, 7, 7),
+  }) {
+    final count = filtered.length + 1;
+    return ListView.builder(
+      controller: _scrollController,
+      padding: padding,
+      itemCount: count,
+      itemBuilder: (_, index) {
+        // Issue #130
+        if (index == count - 1) return UIs.height77;
+        final vnode = ServerProvider.pick(id: filtered[index]);
+        if (vnode == null) return UIs.placeholder;
+        return vnode.listenVal(_buildEachServerCard);
+      },
+    );
+  }
+
+  Widget _buildBodyMedium(List<String> filtered) {
+    final mid = (filtered.length / 2).ceil();
+    final filteredLeft = filtered.sublist(0, mid);
+    final filteredRight = filtered.sublist(mid);
+    return Row(
+      children: [
+        Expanded(
+          child: _buildBodySmall(
+            filtered: filteredLeft,
+            padding: const EdgeInsets.only(left: 7),
+          ),
+        ),
+        Expanded(
+          child: _buildBodySmall(
+            filtered: filteredRight,
+            padding: const EdgeInsets.only(right: 7),
+          ),
+        )
+      ],
+    );
+  }
+
+  Widget _buildEachServerCard(Server? srv) {
+    if (srv == null) {
+      return UIs.placeholder;
+    }
+
+    return CardX(
+      key: Key(srv.spi.id + _tag.value),
+      child: InkWell(
+        onTap: () {
+          if (srv.canViewDetails) {
+            AppRoutes.serverDetail(spi: srv.spi).go(context);
+          } else {
+            ServerEditPage.route.go(context, args: srv.spi);
+          }
+        },
+        onLongPress: () {
+          if (srv.conn == ServerConn.finished) {
+            final id = srv.spi.id;
+            final cardStatus = _getCardNoti(id);
+            cardStatus.value = cardStatus.value.copyWith(
+              flip: !cardStatus.value.flip,
+            );
+          } else {
+            ServerEditPage.route.go(context, args: srv.spi);
+          }
+        },
+        child: Padding(
+          padding: const EdgeInsets.only(
+            left: _cardPadSingle,
+            right: 3,
+            top: _cardPadSingle,
+            bottom: _cardPadSingle,
+          ),
+          child: _buildRealServerCard(srv),
+        ),
       ),
     );
   }
 
-  String _getTopRightStr(
-    ServerState cs,
-    double? temp,
-    String upTime,
-    String? failedInfo,
-  ) {
-    switch (cs) {
-      case ServerState.disconnected:
-        return _s.disconnected;
-      case ServerState.finished:
-        final tempStr = temp == null ? '' : '${temp.toStringAsFixed(1)}°C';
-        final items = [tempStr, upTime];
-        final str = items.where((element) => element.isNotEmpty).join(' | ');
-        if (str.isEmpty) return _s.noResult;
-        return str;
-      case ServerState.loading:
-        return _s.serverTabLoading;
-      case ServerState.connected:
-        return _s.connected;
-      case ServerState.connecting:
-        return _s.serverTabConnecting;
-      case ServerState.failed:
-        if (failedInfo == null) {
-          return _s.serverTabFailed;
-        }
-        if (failedInfo.contains('encypted')) {
-          return _s.serverTabPlzSave;
-        }
-        return failedInfo;
-    }
+  /// The child's width mat not equal to 1/4 of the screen width,
+  /// so we need to wrap it with a SizedBox.
+  Widget _wrapWithSizedbox(Widget child, [bool circle = false]) {
+    var width = (_media.size.width - _cardPad) / (circle ? 4 : 4.3);
+    if (_useDoubleColumn) width /= 2;
+    return SizedBox(
+      width: width,
+      child: child,
+    );
   }
 
-  Widget _buildIOData(String up, String down) {
-    final statusTextStyle = TextStyle(
-        fontSize: 9, color: _theme.textTheme.bodyLarge!.color!.withAlpha(177));
-    return SizedBox(
-      width: _media.size.width * 0.2,
-      child: Column(
-        children: [
-          const SizedBox(height: 5),
-          Text(
-            up,
-            style: statusTextStyle,
-            textAlign: TextAlign.center,
-            textScaleFactor: 1.0,
+  Widget _buildRealServerCard(Server srv) {
+    final id = srv.spi.id;
+    final cardStatus = _getCardNoti(id);
+    final title = _buildServerCardTitle(srv);
+
+    return cardStatus.listenVal((_) {
+      final List<Widget> children = [title];
+      if (srv.conn == ServerConn.finished) {
+        if (cardStatus.value.flip) {
+          children.add(_buildFlippedCard(srv));
+        } else {
+          children.addAll(_buildNormalCard(srv.status, srv.spi));
+        }
+      }
+
+      final height = _calcCardHeight(srv.conn, cardStatus.value.flip);
+      return AnimatedContainer(
+        duration: const Duration(milliseconds: 377),
+        curve: Curves.fastEaseInToSlowEaseOut,
+        height: height,
+        // Use [OverflowBox] to dismiss the warning of [Column] overflow.
+        child: OverflowBox(
+          // If `height == _kCardHeightMin`, the `maxHeight` will be ignored.
+          //
+          // You can comment the `maxHeight` then connect&disconnect the server
+          // to see the difference.
+          maxHeight: height != _kCardHeightMin ? height : null,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: children,
           ),
-          const SizedBox(height: 3),
-          Text(
-            down,
-            style: statusTextStyle,
-            textAlign: TextAlign.center,
-            textScaleFactor: 1.0,
-          )
+        ),
+      );
+    });
+  }
+
+  Widget _buildFlippedCard(Server srv) {
+    const color = Colors.grey;
+    const textStyle = TextStyle(fontSize: 13, color: color);
+    final children = [
+      Btn.column(
+        onTap: () => _askFor(
+          func: () async {
+            if (Stores.setting.showSuspendTip.fetch()) {
+              await context.showRoundDialog(
+                title: libL10n.attention,
+                child: Text(l10n.suspendTip),
+              );
+              Stores.setting.showSuspendTip.put(false);
+            }
+            srv.client?.execWithPwd(
+              ShellFunc.suspend.exec(srv.spi.id),
+              context: context,
+              id: srv.id,
+            );
+          },
+          typ: l10n.suspend,
+          name: srv.spi.name,
+        ),
+        icon: const Icon(Icons.stop, color: color),
+        text: l10n.suspend,
+        textStyle: textStyle,
+      ),
+      Btn.column(
+        onTap: () => _askFor(
+          func: () => srv.client?.execWithPwd(
+            ShellFunc.shutdown.exec(srv.spi.id),
+            context: context,
+            id: srv.id,
+          ),
+          typ: l10n.shutdown,
+          name: srv.spi.name,
+        ),
+        icon: const Icon(Icons.power_off, color: color),
+        text: l10n.shutdown,
+        textStyle: textStyle,
+      ),
+      Btn.column(
+        onTap: () => _askFor(
+          func: () => srv.client?.execWithPwd(
+            ShellFunc.reboot.exec(srv.spi.id),
+            context: context,
+            id: srv.id,
+          ),
+          typ: l10n.reboot,
+          name: srv.spi.name,
+        ),
+        icon: const Icon(Icons.restart_alt, color: color),
+        text: l10n.reboot,
+        textStyle: textStyle,
+      ),
+      Btn.column(
+        onTap: () => ServerEditPage.route.go(context, args: srv.spi),
+        icon: const Icon(Icons.edit, color: color),
+        text: libL10n.edit,
+        textStyle: textStyle,
+      )
+    ];
+
+    final width = (_media.size.width - _cardPad) / children.length;
+    return Padding(
+      padding: const EdgeInsets.only(top: 9),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: children.map((e) {
+          if (width == 0) return e;
+          return SizedBox(width: width, child: e);
+        }).toList(),
+      ),
+    );
+  }
+
+  List<Widget> _buildNormalCard(ServerStatus ss, Spi spi) {
+    return [
+      UIs.height13,
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          _wrapWithSizedbox(PercentCircle(percent: ss.cpu.usedPercent()), true),
+          _wrapWithSizedbox(
+            PercentCircle(percent: ss.mem.usedPercent * 100),
+            true,
+          ),
+          _wrapWithSizedbox(_buildNet(ss, spi.id)),
+          _wrapWithSizedbox(_buildDisk(ss, spi.id)),
         ],
       ),
-    );
+      UIs.height13,
+      if (Stores.setting.moveServerFuncs.fetch() &&
+          // Discussion #146
+          !Stores.setting.serverTabUseOldUI.fetch())
+        SizedBox(
+          height: 27,
+          child: ServerFuncBtns(spi: spi),
+        ),
+    ];
   }
 
-  Widget _buildPercentCircle(double percent) {
-    if (percent <= 0) percent = 0.01;
-    if (percent >= 100) percent = 99.9;
-    return SizedBox(
-      width: _media.size.width * 0.2,
-      child: Stack(
+  Widget _buildServerCardTitle(Server s) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 7, right: 13),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Center(
-            child: CircleChart(
-              progressColor: primaryColor,
-              progressNumber: percent,
-              maxNumber: 100,
-              width: 53,
-              height: 53,
-            ),
-          ),
-          Positioned.fill(
-            child: Center(
-              child: Text(
-                '${percent.toStringAsFixed(1)}%',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 11),
-                textScaleFactor: 1.0,
+          ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: _media.size.width / 2.3),
+            child: Hero(
+              tag: 'home_card_title_${s.spi.id}',
+              transitionOnUserGestures: true,
+              child: Material(
+                color: Colors.transparent,
+                child: Text(
+                  s.spi.name,
+                  style: UIs.text13Bold.copyWith(
+                    color: context.isDark ? Colors.white : Colors.black,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
             ),
           ),
+          const Icon(
+            Icons.keyboard_arrow_right,
+            size: 17,
+            color: Colors.grey,
+          ),
+          const Spacer(),
+          _buildTopRightText(s),
+          _buildTopRightWidget(s),
         ],
       ),
     );
   }
 
-  Future<void> gotoSSH(ServerPrivateInfo spi) async {
-    // as a `Mobile first` app -> handle mobile first
-    if (!isDesktop) {
-      AppRoute(SSHPage(spi: spi), 'ssh page').go(context);
-      return;
-    }
-    final extraArgs = <String>[];
-    if (spi.port != 22) {
-      extraArgs.addAll(['-p', '${spi.port}']);
-    }
+  Widget _buildTopRightWidget(Server s) {
+    final (child, onTap) = switch (s.conn) {
+      ServerConn.connecting || ServerConn.loading || ServerConn.connected => (
+          SizedBox(
+            width: 19,
+            height: 19,
+            child: CircularProgressIndicator(
+              strokeWidth: 3,
+              valueColor: AlwaysStoppedAnimation(UIs.primaryColor),
+            ),
+          ),
+          null,
+        ),
+      ServerConn.failed => (
+          const Icon(Icons.refresh, size: 21, color: Colors.grey),
+          () {
+            TryLimiter.reset(s.spi.id);
+            ServerProvider.refresh(spi: s.spi);
+          },
+        ),
+      ServerConn.disconnected => (
+          const Icon(MingCute.link_3_line, size: 19, color: Colors.grey),
+          () => ServerProvider.refresh(spi: s.spi)
+        ),
+      ServerConn.finished => (
+          const Icon(MingCute.unlink_2_line, size: 17, color: Colors.grey),
+          () => ServerProvider.closeServer(id: s.spi.id),
+        ),
+    };
 
-    final path = () {
-      final tempKeyFileName = 'srvbox_pk_${spi.pubKeyId}';
-      return pathJoin(Directory.systemTemp.path, tempKeyFileName);
-    }();
-    final file = File(path);
-    final shouldGenKey = spi.pubKeyId != null;
-    if (shouldGenKey) {
-      if (await file.exists()) {
-        await file.delete();
-      }
-      await file.writeAsString(getPrivateKey(spi.pubKeyId!));
-      extraArgs.addAll(["-i", path]);
-    }
+    // Or the loading icon will be rescaled.
+    final wrapped = child is SizedBox
+        ? child
+        : SizedBox(height: _kCardHeightMin, width: 27, child: child);
+    if (onTap == null) return wrapped.paddingOnly(left: 10);
+    return InkWell(
+      borderRadius: BorderRadius.circular(7),
+      onTap: onTap,
+      child: wrapped,
+    ).paddingOnly(left: 5);
+  }
 
-    List<String> sshCommand = ["ssh", "${spi.user}@${spi.ip}"] + extraArgs;
-    final system = Platform.operatingSystem;
-    switch (system) {
-      case "windows":
-        await Process.start("cmd", ["/c", "start"] + sshCommand);
-        break;
-      case "linux":
-        await Process.start("x-terminal-emulator", ["-e"] + sshCommand);
-        break;
-      case "macos":
-        await Process.start("osascript", [
-          "-e",
-          'tell application "Terminal" to do script "${sshCommand.join(" ")}"'
-        ]);
-        break;
-      default:
-        showSnackBar(context, Text('Mismatch system: $system'));
-    }
-    // For security reason, delete the private key file after use
-    if (shouldGenKey) {
-      await Future.delayed(const Duration(seconds: 2), file.delete);
-    }
+  Widget _buildTopRightText(Server s) {
+    final hasErr = s.conn == ServerConn.failed && s.status.err != null;
+    final str = s.getTopRightStr(s.spi);
+    if (str == null) return UIs.placeholder;
+    return GestureDetector(
+      onTap: () {
+        if (!hasErr) return;
+        _showFailReason(s.status);
+      },
+      child: Text(str, style: UIs.text13Grey),
+    );
+  }
+
+  void _showFailReason(ServerStatus ss) {
+    final md = '''
+${ss.err?.solution ?? l10n.unknown}
+
+```sh
+${ss.err?.message ?? 'null'}
+''';
+    context.showRoundDialog(
+      title: libL10n.error,
+      child: SingleChildScrollView(child: SimpleMarkdown(data: md)),
+      actions: [
+        TextButton(
+          onPressed: () => Pfs.copy(md),
+          child: Text(libL10n.copy),
+        )
+      ],
+    );
+  }
+
+  Widget _buildDisk(ServerStatus ss, String id) {
+    final cardNoti = _getCardNoti(id);
+    return ListenableBuilder(
+      listenable: cardNoti,
+      builder: (_, __) {
+        final isSpeed = cardNoti.value.diskIO ??
+            !Stores.setting.serverTabPreferDiskAmount.fetch();
+
+        final (r, w) = ss.diskIO.cachedAllSpeed;
+
+        return AnimatedSwitcher(
+          duration: const Duration(milliseconds: 377),
+          transitionBuilder: (Widget child, Animation<double> animation) {
+            return FadeTransition(opacity: animation, child: child);
+          },
+          child: _buildIOData(
+            isSpeed
+                ? '${l10n.read}:\n$r'
+                : 'Total:\n${ss.diskUsage?.size.kb2Str}',
+            isSpeed
+                ? '${l10n.write}:\n$w'
+                : 'Used:\n${ss.diskUsage?.used.kb2Str}',
+            onTap: () {
+              cardNoti.value = cardNoti.value.copyWith(diskIO: !isSpeed);
+            },
+            key: ValueKey(isSpeed),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildNet(ServerStatus ss, String id) {
+    final cardNoti = _getCardNoti(id);
+    final type = cardNoti.value.net ?? Stores.setting.netViewType.fetch();
+    final device = ServerProvider.pick(id: id)?.value.spi.custom?.netDev;
+    final (a, b) = type.build(ss, dev: device);
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 377),
+      transitionBuilder: (c, anim) => FadeTransition(opacity: anim, child: c),
+      child: _buildIOData(
+        a,
+        b,
+        onTap: () => cardNoti.value = cardNoti.value.copyWith(net: type.next),
+        key: ValueKey(type),
+      ),
+    );
+  }
+
+  Widget _buildIOData(
+    String up,
+    String down, {
+    void Function()? onTap,
+    Key? key,
+  }) {
+    final child = Column(
+      children: [
+        Text(
+          up,
+          style: const TextStyle(fontSize: 10, color: Colors.grey),
+          textAlign: TextAlign.center,
+          textScaler: _textFactor,
+        ),
+        const SizedBox(height: 3),
+        Text(
+          down,
+          style: const TextStyle(fontSize: 10, color: Colors.grey),
+          textAlign: TextAlign.center,
+          textScaler: _textFactor,
+        )
+      ],
+    );
+    if (onTap == null) return child;
+    return IconButton(
+      key: key,
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      onPressed: onTap,
+      icon: child,
+    );
   }
 
   @override
@@ -543,10 +647,156 @@ class _ServerPageState extends State<ServerPage>
 
   @override
   Future<void> afterFirstLayout(BuildContext context) async {
-    await GetIt.I.allReady();
-    if (_serverProvider.servers.isEmpty) {
-      await _serverProvider.loadLocalData();
+    ServerProvider.refresh();
+    ServerProvider.startAutoRefresh();
+  }
+
+  List<String> _filterServers(List<String> order) {
+    final tag = _tag.value;
+    if (tag == TagSwitcher.kDefaultTag) return order;
+    return order.where((e) {
+      final tags = ServerProvider.pick(id: e)?.value.spi.tags;
+      if (tags == null) return false;
+      return tags.contains(tag);
+    }).toList();
+  }
+
+  static const _kCardHeightMin = 23.0;
+  static const _kCardHeightFlip = 99.0;
+  static const _kCardHeightNormal = 108.0;
+  static const _kCardHeightMoveOutFuncs = 135.0;
+
+  double? _calcCardHeight(ServerConn cs, bool flip) {
+    if (_textFactorDouble != 1.0) return null;
+    if (cs != ServerConn.finished) {
+      return _kCardHeightMin;
     }
-    _serverProvider.startAutoRefresh();
+    if (flip) {
+      return _kCardHeightFlip;
+    }
+    if (Stores.setting.moveServerFuncs.fetch() &&
+        // Discussion #146
+        !Stores.setting.serverTabUseOldUI.fetch()) {
+      return _kCardHeightMoveOutFuncs;
+    }
+    return _kCardHeightNormal;
+  }
+
+  void _askFor({
+    required void Function() func,
+    required String typ,
+    required String name,
+  }) {
+    context.showRoundDialog(
+      title: libL10n.attention,
+      child: Text(libL10n.askContinue('$typ ${l10n.server}($name)')),
+      actions: Btn.ok(
+        onTap: () {
+          context.pop();
+          func();
+        },
+      ).toList,
+    );
+  }
+
+  _CardNotifier _getCardNoti(String id) => _cardsStatus.putIfAbsent(
+        id,
+        () => _CardNotifier(const _CardStatus()),
+      );
+
+  void _updateOffset() {
+    if (!Stores.setting.fullScreenJitter.fetch()) return;
+    final x = _media.size.height * 0.03;
+    final r = math.Random().nextDouble();
+    final n = math.Random().nextBool() ? 1 : -1;
+    _offset = x * r * n;
+  }
+
+  void _updateTextScaler() {
+    _textFactorDouble = Stores.setting.textFactor.fetch();
+    _textFactor = TextScaler.linear(_textFactorDouble);
+  }
+}
+
+typedef _CardNotifier = ValueNotifier<_CardStatus>;
+
+class _CardStatus {
+  final bool flip;
+  final bool? diskIO;
+  final NetViewType? net;
+
+  const _CardStatus({
+    this.flip = false,
+    this.diskIO,
+    this.net,
+  });
+
+  _CardStatus copyWith({
+    bool? flip,
+    bool? diskIO,
+    NetViewType? net,
+  }) {
+    return _CardStatus(
+      flip: flip ?? this.flip,
+      diskIO: diskIO ?? this.diskIO,
+      net: net ?? this.net,
+    );
+  }
+}
+
+extension _ServerX on Server {
+  String? getTopRightStr(Spi spi) {
+    switch (conn) {
+      case ServerConn.disconnected:
+        return null;
+      case ServerConn.finished:
+        // Highest priority of temperature display
+        final cmdTemp = () {
+          final val = status.customCmds['server_card_top_right'];
+          if (val == null) return null;
+          // This returned value is used on server card top right, so it should
+          // be a single line string.
+          return val.split('\n').lastOrNull;
+        }();
+        final temperatureVal = () {
+          // Second priority
+          final preferTempDev = spi.custom?.preferTempDev;
+          if (preferTempDev != null) {
+            final preferTemp = status.sensors
+                .firstWhereOrNull((e) => e.device == preferTempDev)
+                ?.summary
+                ?.split(' ')
+                .firstOrNull;
+            if (preferTemp != null) {
+              return double.tryParse(preferTemp.replaceFirst('°C', ''));
+            }
+          }
+          // Last priority
+          final temp = status.temps.first;
+          if (temp != null) {
+            return temp;
+          }
+          return null;
+        }();
+        final upTime = status.more[StatusCmdType.uptime];
+        final items = [
+          cmdTemp ??
+              (temperatureVal != null
+                  ? '${temperatureVal.toStringAsFixed(1)}°C'
+                  : null),
+          upTime
+        ];
+        final str = items.where((e) => e != null && e.isNotEmpty).join(' | ');
+        if (str.isEmpty) return libL10n.empty;
+        return str;
+      case ServerConn.loading:
+        return null;
+      case ServerConn.connected:
+        return null;
+      case ServerConn.connecting:
+        return null;
+      case ServerConn.failed:
+        return status.err != null ? l10n.viewErr : libL10n.fail;
+    }
   }
 }

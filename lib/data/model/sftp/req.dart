@@ -1,15 +1,13 @@
-import 'dart:async';
-
-import '../../../core/utils/server.dart';
-import '../server/server_private_info.dart';
-import 'worker.dart';
+part of 'worker.dart';
 
 class SftpReq {
-  final ServerPrivateInfo spi;
+  final Spi spi;
   final String remotePath;
   final String localPath;
   final SftpReqType type;
   String? privateKey;
+  Spi? jumpSpi;
+  String? jumpPrivateKey;
 
   SftpReq(
     this.spi,
@@ -17,8 +15,13 @@ class SftpReq {
     this.localPath,
     this.type,
   ) {
-    if (spi.pubKeyId != null) {
-      privateKey = getPrivateKey(spi.pubKeyId!);
+    final keyId = spi.keyId;
+    if (keyId != null) {
+      privateKey = getPrivateKey(keyId);
+    }
+    if (spi.jumpId != null) {
+      jumpSpi = Stores.server.box.get(spi.jumpId);
+      jumpPrivateKey = Stores.key.fetchOne(jumpSpi?.keyId)?.key;
     }
   }
 }
@@ -58,32 +61,37 @@ class SftpReqStatus {
   @override
   int get hashCode => id ^ super.hashCode;
 
+  void dispose() {
+    worker._dispose();
+    completer?.complete(true);
+  }
+
   void onNotify(dynamic event) {
-    switch (event.runtimeType) {
-      case SftpWorkerStatus:
-        status = event;
+    var shouldDispose = false;
+    switch (event) {
+      case final SftpWorkerStatus val:
+        status = val;
         if (status == SftpWorkerStatus.finished) {
-          worker.dispose();
-          completer?.complete();
+          dispose();
         }
         break;
-      case double:
-        progress = event;
+      case final double val:
+        progress = val;
         break;
-      case int:
-        size = event;
+      case final int val:
+        size = val;
         break;
-      case Exception:
-        error = event;
-        break;
-      case Duration:
-        spentTime = event;
+      case final Duration d:
+        spentTime = d;
         break;
       default:
-        error = Exception('unknown event: $event');
+        error = Exception('sftp worker event: $event');
+        Loggers.app.warning(error);
+        shouldDispose = true;
     }
     notifyListeners();
+    if (shouldDispose) dispose();
   }
 }
 
-enum SftpWorkerStatus { preparing, sshConnectted, downloading, finished }
+enum SftpWorkerStatus { preparing, sshConnectted, loading, finished }

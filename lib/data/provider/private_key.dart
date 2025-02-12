@@ -1,37 +1,45 @@
-import 'package:flutter/material.dart';
-import 'package:toolbox/data/model/server/private_key_info.dart';
-import 'package:toolbox/data/store/private_key.dart';
-import 'package:toolbox/locator.dart';
+import 'package:fl_lib/fl_lib.dart';
+import 'package:server_box/core/sync.dart';
+import 'package:server_box/data/model/server/private_key_info.dart';
+import 'package:server_box/data/res/store.dart';
 
-class PrivateKeyProvider extends ChangeNotifier {
-  List<PrivateKeyInfo> get pkis => _pkis;
-  final _store = locator<PrivateKeyStore>();
-  late List<PrivateKeyInfo> _pkis;
+class PrivateKeyProvider extends Provider {
+  const PrivateKeyProvider._();
+  static const instance = PrivateKeyProvider._();
 
-  void loadData() {
-    _pkis = _store.fetch();
+  static final pkis = <PrivateKeyInfo>[].vn;
+
+  @override
+  void load() {
+    super.load();
+    pkis.value = Stores.key.fetch();
   }
 
-  void add(PrivateKeyInfo info) {
-    _pkis.add(info);
-    _store.put(info);
-    notifyListeners();
+  static void add(PrivateKeyInfo info) {
+    pkis.value.add(info);
+    pkis.notify();
+    Stores.key.put(info);
+    bakSync.sync(milliDelay: 1000);
   }
 
-  void delete(PrivateKeyInfo info) {
-    _pkis.removeWhere((e) => e.id == info.id);
-    _store.delete(info);
-    notifyListeners();
+  static void delete(PrivateKeyInfo info) {
+    pkis.value.removeWhere((e) => e.id == info.id);
+    pkis.notify();
+    Stores.key.delete(info);
+    bakSync.sync(milliDelay: 1000);
   }
 
-  void update(PrivateKeyInfo old, PrivateKeyInfo newInfo) {
-    final idx = _pkis.indexWhere((e) => e.id == old.id);
+  static void update(PrivateKeyInfo old, PrivateKeyInfo newInfo) {
+    final idx = pkis.value.indexWhere((e) => e.id == old.id);
     if (idx == -1) {
-      _pkis.add(newInfo);
+      pkis.value.add(newInfo);
+      Stores.key.put(newInfo);
+      Stores.key.delete(old);
     } else {
-      _pkis[idx] = newInfo;
+      pkis.value[idx] = newInfo;
+      Stores.key.put(newInfo);
     }
-    _store.put(newInfo);
-    notifyListeners();
+    pkis.notify();
+    bakSync.sync(milliDelay: 1000);
   }
 }
